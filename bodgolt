@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# bodgolt — local Godbolt-style compiler explorer
+# Usage: bodgolt <file.cpp> [options]
+#   --compiler <path>    C++ compiler to use (default: g++)
+#   --std <standard>     C++ standard (default: c++20)
+#   --flags <flags>      Extra compiler flags (quoted string)
+#   --watch              Re-compile on file change (requires entr)
+#   --demangle           Demangle C++ symbols (default: on)
+#   --no-demangle        Don't demangle symbols
+#   --filter             Filter out directives/labels (default: on)
+#   --no-filter          Show raw assembly including directives
+#   -O0|-O1|-O2|-O3|-Os  Optimization level (default: -O2)
+
+usage() {
+    sed -n '3,13p' "$0" | sed 's/^# \?//'
+    exit 1
+}
+
+# Defaults
+COMPILER="g++"
+STD="c++20"
+OPT="-O2"
+EXTRA_FLAGS=""
+WATCH=0
+DEMANGLE=1
+FILTER=1
+SOURCE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --compiler)  COMPILER="$2"; shift 2 ;;
+        --std)       STD="$2"; shift 2 ;;
+        --flags)     EXTRA_FLAGS="$2"; shift 2 ;;
+        --watch)     WATCH=1; shift ;;
+        --demangle)  DEMANGLE=1; shift ;;
+        --no-demangle) DEMANGLE=0; shift ;;
+        --filter)    FILTER=1; shift ;;
+        --no-filter) FILTER=0; shift ;;
+        -O*)         OPT="$1"; shift ;;
+        -h|--help)   usage ;;
+        -*)          echo "Unknown option: $1" >&2; usage ;;
+        *)
+            if [[ -z "$SOURCE" ]]; then
+                SOURCE="$1"; shift
+            else
+                echo "Unexpected argument: $1" >&2; usage
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$SOURCE" ]]; then
+    echo "Error: no source file specified" >&2
+    usage
+fi
+
+if [[ ! -f "$SOURCE" ]]; then
+    echo "Error: file not found: $SOURCE" >&2
+    exit 1
+fi
+
+compile_and_show() {
+    local src="$1"
+    local tmpasm
+    tmpasm=$(mktemp /tmp/bodgolt-XXXXXX).s
+    trap "rm -f '$tmpasm'" RETURN
+
+    local cmd=("$COMPILER" "-std=$STD" "$OPT" -S -o "$tmpasm" -fno-asynchronous-unwind-tables)
+    # Use Intel syntax on x86 for readability
+    if [[ "$(uname -m)" == x86_64 ]]; then
+        cmd+=(-masm=intel)
+    fi
+
+    # shellcheck disable=SC2086
+    IFS=' ' read -ra extra_arr <<< "$EXTRA_FLAGS"
+    if [[ ${#extra_arr[@]} -gt 0 ]]; then
+        cmd+=("${extra_arr[@]}")
+    fi
+    cmd+=("$src")
+
+    # Header
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    local sep
+    sep=$(printf '%*s' "$cols" '' | tr ' ' '─')
+
+    clear
+    echo -e "\033[1;36m$sep\033[0m"
+    echo -e "\033[1;37m  bodgolt\033[0m  \033[0;33m${cmd[*]}\033[0m"
+    echo -e "\033[1;36m$sep\033[0m"
+    echo ""
+
+    # Compile
+    local compile_output
+    if ! compile_output=$("${cmd[@]}" 2>&1); then
+        echo -e "\033[1;31mCompilation failed:\033[0m"
+        echo "$compile_output"
+        return 1
+    fi
+
+    local asm
+    asm=$(cat "$tmpasm")
+
+    # Demangle
+    if [[ "$DEMANGLE" -eq 1 ]] && command -v c++filt &>/dev/null; then
+        asm=$(echo "$asm" | c++filt)
+    fi
+
+    # Filter out noise (directives, comments, empty labels)
+    if [[ "$FILTER" -eq 1 ]]; then
+        asm=$(echo "$asm" | grep -v '^\s*\.' | grep -v '^\s*$' || true)
+    fi
+
+    # Colorize: labels in green, instructions in white, comments in gray
+    echo "$asm" | while IFS= read -r line; do
+        if [[ "$line" =~ ^[a-zA-Z_] ]]; then
+            # Label
+            echo -e "\033[1;32m${line}\033[0m"
+        elif [[ "$line" =~ ^[[:space:]]*# ]]; then
+            # Comment
+            echo -e "\033[0;90m${line}\033[0m"
+        else
+            # Instruction — highlight the mnemonic
+            if [[ "$line" =~ ^([[:space:]]+)([a-z][a-z0-9]*)(.*) ]]; then
+                echo -e "${BASH_REMATCH[1]}\033[1;33m${BASH_REMATCH[2]}\033[0m${BASH_REMATCH[3]}"
+            else
+                echo "$line"
+            fi
+        fi
+    done
+
+    echo ""
+    local line_count
+    line_count=$(echo "$asm" | wc -l | tr -d ' ')
+    echo -e "\033[0;90m── ${line_count} lines ──\033[0m"
+}
+
+if [[ "$WATCH" -eq 1 ]]; then
+    if ! command -v entr &>/dev/null; then
+        echo "Error: --watch requires 'entr'. Install it: brew install entr / nix-env -iA nixpkgs.entr" >&2
+        exit 1
+    fi
+    # Build the full command to re-invoke ourselves with the same args
+    self_cmd=$(printf '%q ' "$0" "$SOURCE" --compiler "$COMPILER" --std "$STD" "$OPT")
+    [[ -n "$EXTRA_FLAGS" ]] && self_cmd+=$(printf ' --flags %q' "$EXTRA_FLAGS")
+    [[ "$DEMANGLE" -eq 0 ]] && self_cmd+=" --no-demangle"
+    [[ "$FILTER" -eq 0 ]] && self_cmd+=" --no-filter"
+
+    compile_and_show "$SOURCE"
+    while true; do
+        echo "$SOURCE" | entr -d -p -s "$self_cmd"
+    done
+else
+    compile_and_show "$SOURCE"
+fi
