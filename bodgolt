@@ -11,12 +11,20 @@ set -euo pipefail
 #   --no-demangle        Don't demangle symbols
 #   --filter             Filter out directives/labels (default: on)
 #   --no-filter          Show raw assembly including directives
+#   --no-elide           Show full data sections (default: elided)
+#   --stdlib             Include standard library / compiler internals
 #   -O0|-O1|-O2|-O3|-Os  Optimization level (default: -O2)
 
 usage() {
-    sed -n '3,13p' "$0" | sed 's/^# \?//'
+    sed -n '3,15p' "$0" | sed 's/^# \?//'
     exit 1
 }
+
+# Color support — disable when piped
+COLOR=1
+if [[ ! -t 1 ]]; then
+    COLOR=0
+fi
 
 # Defaults
 COMPILER="g++"
@@ -26,6 +34,8 @@ EXTRA_FLAGS=""
 WATCH=0
 DEMANGLE=1
 FILTER=1
+ELIDE=1
+LIBFILTER=1
 SOURCE=""
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +48,10 @@ while [[ $# -gt 0 ]]; do
         --no-demangle) DEMANGLE=0; shift ;;
         --filter)    FILTER=1; shift ;;
         --no-filter) FILTER=0; shift ;;
+        --elide)     ELIDE=1; shift ;;
+        --no-elide)  ELIDE=0; shift ;;
+        --stdlib)    LIBFILTER=0; shift ;;
+        --no-stdlib) LIBFILTER=1; shift ;;
         -O*)         OPT="$1"; shift ;;
         -h|--help)   usage ;;
         -*)          echo "Unknown option: $1" >&2; usage ;;
@@ -86,16 +100,26 @@ compile_and_show() {
     local sep
     sep=$(printf '%*s' "$cols" '' | tr ' ' '─')
 
-    clear
-    echo -e "\033[1;36m$sep\033[0m"
-    echo -e "\033[1;37m  bodgolt\033[0m  \033[0;33m${cmd[*]}\033[0m"
-    echo -e "\033[1;36m$sep\033[0m"
+    if [[ "$COLOR" -eq 1 ]]; then
+        clear
+        echo -e "\033[1;36m$sep\033[0m"
+        echo -e "\033[1;37m  bodgolt\033[0m  \033[0;33m${cmd[*]}\033[0m"
+        echo -e "\033[1;36m$sep\033[0m"
+    else
+        echo "$sep"
+        echo "  bodgolt  ${cmd[*]}"
+        echo "$sep"
+    fi
     echo ""
 
     # Compile
     local compile_output
     if ! compile_output=$("${cmd[@]}" 2>&1); then
-        echo -e "\033[1;31mCompilation failed:\033[0m"
+        if [[ "$COLOR" -eq 1 ]]; then
+            echo -e "\033[1;31mCompilation failed:\033[0m"
+        else
+            echo "Compilation failed:"
+        fi
         echo "$compile_output"
         return 1
     fi
@@ -108,33 +132,122 @@ compile_and_show() {
         asm=$(echo "$asm" | c++filt)
     fi
 
-    # Filter out noise (directives, comments, empty labels)
-    if [[ "$FILTER" -eq 1 ]]; then
-        asm=$(echo "$asm" | grep -v '^\s*\.' | grep -v '^\s*$' || true)
+    # Filter, elide, and strip stdlib
+    if [[ "$FILTER" -eq 1 || "$ELIDE" -eq 1 || "$LIBFILTER" -eq 1 ]]; then
+        asm=$(echo "$asm" | awk -v filter="$FILTER" -v elide="$ELIDE" -v libfilter="$LIBFILTER" '
+            BEGIN { drun = 0; skip_fn = 0 }
+
+            function flush_data() {
+                if (drun == 0) return
+                if (drun > 3 && elide) {
+                    print "; ... " drun " lines of data"
+                } else {
+                    for (i = 0; i < drun; i++) print dbuf[i]
+                }
+                drun = 0
+            }
+
+            function is_lib_label(line) {
+                # stdlib (demangled)
+                if (line ~ /^(void |unsigned )?std::/) return 1
+                # stdlib (mangled): _ZNSt, _ZSt, _ZNKSt, _ZGVNSt
+                if (line ~ /^_Z[A-Z]*St/) return 1
+                # compiler internals
+                if (line ~ /^_?__(cxx_|gnu_cxx|clang_call_terminate|cxa_)/) return 1
+                if (line ~ /^_?_GLOBAL__sub_I_/) return 1
+                if (line ~ /^GCC_except_table/) return 1
+                return 0
+            }
+
+            # End-of-function marker — stop skipping
+            skip_fn && /; -- End function/ {
+                skip_fn = 0
+                next
+            }
+
+            # While inside a skipped function, eat everything
+            skip_fn { next }
+
+            # Function labels — check if stdlib/internal
+            /^[a-zA-Z_].*:/ {
+                if (libfilter && is_lib_label($0)) {
+                    flush_data()
+                    skip_fn = 1
+                    next
+                }
+            }
+
+            # Empty lines
+            /^[[:space:]]*$/ { if (!filter) print; next }
+
+            # Noise directives — skip when filtering
+            filter && /^[[:space:]]*\.(cfi_|file[[:space:]]|loc[[:space:]]|type[[:space:]]|size[[:space:]]|ident|section[[:space:]]|text$|data$|bss$|globl[[:space:]]|global[[:space:]]|local[[:space:]]|weak[[:space:]]|hidden[[:space:]]|protected[[:space:]]|p2align|balign|align[[:space:]]|addrsig|build_version|subsections_via_symbols|set[[:space:]]|uleb128|sleb128|macosx_version)/ {
+                next
+            }
+
+            # Data directives — buffer for elision
+            /^[[:space:]]*\.(byte|short|hword|value|2byte|long|4byte|float|quad|8byte|double|octa|ascii|asciz|string|zero|space|fill)[[:space:]]/ {
+                if (elide) {
+                    dbuf[drun++] = $0
+                    next
+                }
+                if (filter) next
+                print
+                next
+            }
+
+            # Private/local labels (l_.*, L_.*, .L*) — treat as data, not code
+            elide && /^(l_|L_|\.[Ll])[a-zA-Z0-9_.]*:/ {
+                dbuf[drun++] = $0
+                next
+            }
+
+            # Assembly comments between data lines — absorb into data run
+            elide && drun > 0 && /^[[:space:]]*;/ {
+                dbuf[drun++] = $0
+                next
+            }
+
+            # Remaining directives when filtering
+            filter && /^[[:space:]]*\./ { next }
+
+            # Everything else — flush any buffered data, then print
+            { flush_data(); print }
+
+            END { flush_data() }
+        ')
     fi
 
-    # Colorize: labels in green, instructions in white, comments in gray
-    echo "$asm" | while IFS= read -r line; do
-        if [[ "$line" =~ ^[a-zA-Z_] ]]; then
-            # Label
-            echo -e "\033[1;32m${line}\033[0m"
-        elif [[ "$line" =~ ^[[:space:]]*# ]]; then
-            # Comment
-            echo -e "\033[0;90m${line}\033[0m"
-        else
-            # Instruction — highlight the mnemonic
-            if [[ "$line" =~ ^([[:space:]]+)([a-z][a-z0-9]*)(.*) ]]; then
-                echo -e "${BASH_REMATCH[1]}\033[1;33m${BASH_REMATCH[2]}\033[0m${BASH_REMATCH[3]}"
+    if [[ "$COLOR" -eq 1 ]]; then
+        # Colorize: labels in green, instructions in yellow, comments in gray
+        echo "$asm" | while IFS= read -r line; do
+            if [[ "$line" == "; ..."* ]]; then
+                # Elided data summary
+                echo -e "\033[0;90m${line}\033[0m"
+            elif [[ "$line" =~ ^[a-zA-Z_] ]]; then
+                echo -e "\033[1;32m${line}\033[0m"
+            elif [[ "$line" =~ ^[[:space:]]*# ]]; then
+                echo -e "\033[0;90m${line}\033[0m"
             else
-                echo "$line"
+                if [[ "$line" =~ ^([[:space:]]+)([a-z][a-z0-9]*)(.*) ]]; then
+                    echo -e "${BASH_REMATCH[1]}\033[1;33m${BASH_REMATCH[2]}\033[0m${BASH_REMATCH[3]}"
+                else
+                    echo "$line"
+                fi
             fi
-        fi
-    done
+        done
+    else
+        echo "$asm"
+    fi
 
     echo ""
     local line_count
     line_count=$(echo "$asm" | wc -l | tr -d ' ')
-    echo -e "\033[0;90m── ${line_count} lines ──\033[0m"
+    if [[ "$COLOR" -eq 1 ]]; then
+        echo -e "\033[0;90m── ${line_count} lines ──\033[0m"
+    else
+        echo "── ${line_count} lines ──"
+    fi
 }
 
 if [[ "$WATCH" -eq 1 ]]; then
@@ -147,6 +260,8 @@ if [[ "$WATCH" -eq 1 ]]; then
     [[ -n "$EXTRA_FLAGS" ]] && self_cmd+=$(printf ' --flags %q' "$EXTRA_FLAGS")
     [[ "$DEMANGLE" -eq 0 ]] && self_cmd+=" --no-demangle"
     [[ "$FILTER" -eq 0 ]] && self_cmd+=" --no-filter"
+    [[ "$ELIDE" -eq 0 ]] && self_cmd+=" --no-elide"
+    [[ "$LIBFILTER" -eq 0 ]] && self_cmd+=" --stdlib"
 
     compile_and_show "$SOURCE"
     while true; do

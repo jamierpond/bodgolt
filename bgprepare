@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# bgprepare — Flatten a C++ header/source into a single Godbolt-pastable file
+# Usage: bgprepare <file.hpp|file.cpp> [options]
+#   -I <dir>        Add include search path (repeatable)
+#   --compdb <path> Read -I paths from compile_commands.json (auto-detected)
+#   -o <file>       Write to file instead of stdout
+#   --keep-guards   Keep #pragma once / include guards (default: strip)
+#   --keep-system   Expand <system> includes too (default: leave as-is)
+#   --no-compdb     Disable automatic compile_commands.json detection
+#   -h, --help      Show this help
+
+usage() {
+    sed -n '3,11p' "$0" | sed 's/^# \?//'
+    exit 1
+}
+
+# Defaults
+SEARCH_PATHS=()
+COMPDB=""
+NO_COMPDB=0
+OUTPUT=""
+KEEP_GUARDS=0
+EXPAND_SYSTEM=0
+SOURCE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -I)           SEARCH_PATHS+=("$2"); shift 2 ;;
+        --compdb)     COMPDB="$2"; shift 2 ;;
+        --no-compdb)  NO_COMPDB=1; shift ;;
+        -o)           OUTPUT="$2"; shift 2 ;;
+        --keep-guards) KEEP_GUARDS=1; shift ;;
+        --keep-system) EXPAND_SYSTEM=1; shift ;;
+        -h|--help)    usage ;;
+        -*)           echo "Unknown option: $1" >&2; usage ;;
+        *)
+            if [[ -z "$SOURCE" ]]; then
+                SOURCE="$1"; shift
+            else
+                echo "Unexpected argument: $1" >&2; usage
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$SOURCE" ]]; then
+    echo "Error: no source file specified" >&2
+    usage
+fi
+
+if [[ ! -f "$SOURCE" ]]; then
+    echo "Error: file not found: $SOURCE" >&2
+    exit 1
+fi
+
+# Resolve to absolute path
+SOURCE="$(cd "$(dirname "$SOURCE")" && pwd)/$(basename "$SOURCE")"
+
+# ── compile_commands.json discovery ──
+# Walk up from the source file looking for compile_commands.json
+find_compdb() {
+    local dir="$1"
+    while [[ "$dir" != "/" ]]; do
+        # Check dir itself, then common build subdirs
+        for candidate in "$dir/compile_commands.json" "$dir/build/compile_commands.json"; do
+            if [[ -f "$candidate" ]]; then
+                echo "$candidate"
+                return 0
+            fi
+        done
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Extract -I and -isystem paths from compile_commands.json for a given file.
+# If the exact file isn't in the compdb (common for headers), grab include
+# paths from any entry — they're typically project-wide.
+extract_includes_from_compdb() {
+    local compdb="$1"
+    local source_file="$2"
+
+    # Try exact match first, then fall back to first entry
+    python3 -c "
+import json, sys, os, re
+
+compdb_path = sys.argv[1]
+source_file = sys.argv[2]
+
+with open(compdb_path) as f:
+    entries = json.load(f)
+
+# Try exact match on the source file
+match = None
+for e in entries:
+    if os.path.abspath(e['file']) == source_file:
+        match = e
+        break
+
+# Headers won't be in compdb — use first entry's includes
+if match is None and entries:
+    match = entries[0]
+
+if match is None:
+    sys.exit(0)
+
+cmd = match.get('command', '')
+if not cmd and 'arguments' in match:
+    cmd = ' '.join(match['arguments'])
+
+# Extract -I and -isystem paths
+paths = set()
+for m in re.finditer(r'-I\s*(\S+)', cmd):
+    p = m.group(1)
+    if not os.path.isabs(p):
+        p = os.path.join(match.get('directory', '.'), p)
+    paths.add(os.path.abspath(p))
+for m in re.finditer(r'-isystem\s*(\S+)', cmd):
+    p = m.group(1)
+    if not os.path.isabs(p):
+        p = os.path.join(match.get('directory', '.'), p)
+    paths.add(os.path.abspath(p))
+
+for p in sorted(paths):
+    print(p)
+" "$compdb" "$source_file"
+}
+
+if [[ "$NO_COMPDB" -eq 0 ]]; then
+    # Use explicit --compdb, or auto-detect
+    if [[ -n "$COMPDB" ]]; then
+        if [[ ! -f "$COMPDB" ]]; then
+            echo "Error: compile_commands.json not found: $COMPDB" >&2
+            exit 1
+        fi
+    else
+        COMPDB=$(find_compdb "$(dirname "$SOURCE")") || true
+    fi
+
+    if [[ -n "$COMPDB" ]]; then
+        echo "Using $COMPDB" >&2
+        while IFS= read -r inc_dir; do
+            SEARCH_PATHS+=("$inc_dir")
+        done < <(extract_includes_from_compdb "$COMPDB" "$SOURCE")
+    fi
+fi
+
+# Track already-included files to avoid double-inclusion
+declare -A INCLUDED
+
+# Resolve an include path against search dirs + the including file's directory
+resolve_include() {
+    local name="$1"
+    local from_dir="$2"
+
+    # Try relative to the including file first
+    if [[ -f "$from_dir/$name" ]]; then
+        echo "$(cd "$from_dir" && cd "$(dirname "$name")" && pwd)/$(basename "$name")"
+        return 0
+    fi
+
+    # Try each -I path
+    for dir in "${SEARCH_PATHS[@]}"; do
+        if [[ -f "$dir/$name" ]]; then
+            echo "$(cd "$dir" && cd "$(dirname "$name")" && pwd)/$(basename "$name")"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Recursively expand a file
+expand_file() {
+    local filepath="$1"
+    local filedir
+    filedir="$(dirname "$filepath")"
+
+    # Guard against double-inclusion
+    if [[ -n "${INCLUDED[$filepath]:-}" ]]; then
+        return
+    fi
+    INCLUDED["$filepath"]=1
+
+    # Read file into array so we can detect include guard patterns
+    local -a lines=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lines+=("$line")
+    done < "$filepath"
+
+    local start=0
+    local end=${#lines[@]}
+    local guard_name=""
+
+    # Detect and strip classic include guards: #ifndef X / #define X ... #endif
+    if [[ "$KEEP_GUARDS" -eq 0 && ${#lines[@]} -ge 2 ]]; then
+        if [[ "${lines[0]}" =~ ^[[:space:]]*#[[:space:]]*ifndef[[:space:]]+([A-Za-z_][A-Za-z_0-9]*) ]]; then
+            guard_name="${BASH_REMATCH[1]}"
+            if [[ "${lines[1]}" =~ ^[[:space:]]*#[[:space:]]*define[[:space:]]+${guard_name} ]]; then
+                start=2
+                # Find matching #endif at end (skip trailing blanks)
+                local i=$((end - 1))
+                while [[ $i -gt $start && "${lines[$i]}" =~ ^[[:space:]]*$ ]]; do
+                    ((i--))
+                done
+                if [[ "${lines[$i]}" =~ ^[[:space:]]*#[[:space:]]*endif ]]; then
+                    end=$i
+                fi
+            fi
+        fi
+    fi
+
+    local idx
+    for ((idx = start; idx < end; idx++)); do
+        local line="${lines[$idx]}"
+
+        # Strip #pragma once
+        if [[ "$KEEP_GUARDS" -eq 0 && "$line" =~ ^[[:space:]]*#[[:space:]]*pragma[[:space:]]+once ]]; then
+            continue
+        fi
+
+        # Match #include "local.h"
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*include[[:space:]]+\"([^\"]+)\" ]]; then
+            local inc_name="${BASH_REMATCH[1]}"
+            local resolved
+            if resolved=$(resolve_include "$inc_name" "$filedir"); then
+                echo "// ---- begin: $inc_name ----"
+                expand_file "$resolved"
+                echo "// ---- end: $inc_name ----"
+            else
+                echo "// bgprepare: could not resolve: $inc_name"
+                echo "$line"
+            fi
+            continue
+        fi
+
+        # Match #include <system.h> — expand only with --keep-system
+        if [[ "$EXPAND_SYSTEM" -eq 1 && "$line" =~ ^[[:space:]]*#[[:space:]]*include[[:space:]]+\<([^\>]+)\> ]]; then
+            local inc_name="${BASH_REMATCH[1]}"
+            local resolved
+            if resolved=$(resolve_include "$inc_name" "$filedir"); then
+                echo "// ---- begin: <$inc_name> ----"
+                expand_file "$resolved"
+                echo "// ---- end: <$inc_name> ----"
+            else
+                # System header we can't find locally — leave as-is
+                echo "$line"
+            fi
+            continue
+        fi
+
+        echo "$line"
+    done
+}
+
+# Run expansion and output
+if [[ -n "$OUTPUT" ]]; then
+    expand_file "$SOURCE" > "$OUTPUT"
+    wc_lines=$(wc -l < "$OUTPUT" | tr -d ' ')
+    echo "Wrote $wc_lines lines to $OUTPUT" >&2
+else
+    expand_file "$SOURCE"
+fi
